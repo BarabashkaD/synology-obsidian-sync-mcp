@@ -1,0 +1,17 @@
+# Generated secrets
+.env
+**/.env
+connection.txt
+**/connection.txt
+
+# Runtime data
+couchdb-data/
+**/couchdb-data/
+mcp-data/
+**/mcp-data/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+.DS_Store
