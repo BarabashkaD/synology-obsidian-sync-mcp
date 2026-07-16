@@ -1,0 +1,1 @@
+# synology-obsidian-sync-mcp
