@@ -114,6 +114,13 @@ main() {
     docker inspect -f '{{.State.Running}}' "obsidian-mcp-$TEST_USER" | grep -qx true \
         || fail "MCP container is not running"
 
+    log "Testing MCP authentication, protocol and note tools"
+    docker cp "$REPO_ROOT/tests/test-mcp.mjs" \
+        "obsidian-mcp-$TEST_USER:/tmp/test-mcp.mjs"
+    docker exec \
+        -e MCP_URL="http://127.0.0.1:8787/mcp" \
+        "obsidian-mcp-$TEST_USER" node /tmp/test-mcp.mjs
+
     couchdb_url="http://127.0.0.1:$COUCHDB_PORT"
     document_url="$couchdb_url/$COUCHDB_DATABASE/linux-integration-test"
 

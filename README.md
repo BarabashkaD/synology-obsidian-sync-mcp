@@ -55,8 +55,9 @@ Obsidian clients use the Self-hosted LiveSync community plugin to synchronize wi
 GitHub Actions runs syntax checks, ShellCheck and a real container installation on
 every pushed commit and pull request. The integration test creates a disposable
 Linux user and isolated directories below `/tmp`, installs the stack, verifies
-CouchDB access and persistence, checks MCP container startup, exercises status
-and duplicate protection, and then removes its containers, user and files.
+CouchDB access and persistence, tests MCP authentication and note operations,
+exercises status and duplicate protection, and then removes its containers, user
+and files.
 
 Run the same test on a general Linux host with Docker, Compose, curl, OpenSSL and
 the standard `useradd`/`userdel` account tools:
