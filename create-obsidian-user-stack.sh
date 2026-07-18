@@ -1,10 +1,17 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-BASE_ROOT="/volume1/docker/obsidian-users"
-MCP_IMAGE="ghcr.io/es617/obsidian-sync-mcp:latest"
-COUCHDB_IMAGE="couchdb:3"
-CURL_IMAGE="curlimages/curl:8.10.1"
+BASE_ROOT="${BASE_ROOT:-/volume1/docker/obsidian-users}"
+USER_HOME_ROOT="${USER_HOME_ROOT:-/var/services/homes}"
+NAS_IP="${NAS_IP:-}"
+# Upstream package version 0.5.2. GHCR does not publish versioned tags.
+MCP_IMAGE="${MCP_IMAGE:-ghcr.io/es617/obsidian-sync-mcp@sha256:59ab4dbe7af00417331c37c1c260df320d3bbd1bb7c6a3386a5d4c1c0ece5850}"
+COUCHDB_IMAGE="${COUCHDB_IMAGE:-couchdb:3}"
+CURL_IMAGE="${CURL_IMAGE:-curlimages/curl:8.10.1}"
+COUCHDB_UID="${COUCHDB_UID:-5984}"
+COUCHDB_GID="${COUCHDB_GID:-5984}"
+COUCHDB_PORT_BASE="${COUCHDB_PORT_BASE:-5980}"
+MCP_PORT_BASE="${MCP_PORT_BASE:-8780}"
 LOCK_DIR="${BASE_ROOT}/.create.lock"
 INSTALL_IN_PROGRESS=0
 BASE_DIR=""
@@ -63,8 +70,8 @@ get_user_home() {
         home="$(awk -F: -v u="$user" '$1==u {print $6; exit}' /etc/passwd 2>/dev/null || true)"
     fi
 
-    if [[ -z "$home" || "$home" == "/var/services/homes" ]]; then
-        home="/var/services/homes/${user}"
+    if [[ -z "$home" || "$home" == "$USER_HOME_ROOT" ]]; then
+        home="${USER_HOME_ROOT}/${user}"
     fi
 
     printf '%s\n' "$home"
@@ -90,13 +97,13 @@ check_synology_user_and_home() {
     id "$user" >/dev/null 2>&1 \
         || die "User '$user' is not available through the local account database"
 
-    [[ -d /var/services/homes ]] \
-        || die "Synology User Home service is not enabled: /var/services/homes is missing"
+    [[ -d "$USER_HOME_ROOT" ]] \
+        || die "User home root is missing: $USER_HOME_ROOT"
 
     USER_HOME="$(get_user_home "$user")"
 
-    [[ "$USER_HOME" == /var/services/homes/* ]] \
-        || die "User '$user' does not use Synology User Home: detected home '$USER_HOME'"
+    [[ "$USER_HOME" == "$USER_HOME_ROOT"/* ]] \
+        || die "User '$user' has home '$USER_HOME', outside '$USER_HOME_ROOT'"
 
     [[ -d "$USER_HOME" ]] \
         || die "Home directory '$USER_HOME' does not exist. Enable User Home service and sign in once as '$user'"
@@ -116,9 +123,27 @@ is_private_ipv4() {
     return 1
 }
 
+is_ipv4() {
+    local ip="$1"
+    local octet=""
+    local -a octets=()
+
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
 detect_nas_ip() {
     local ip_bin=""
     local candidate=""
+
+    if [[ -n "$NAS_IP" ]]; then
+        is_ipv4 "$NAS_IP" || die "Configured NAS_IP is not a valid IPv4 address: $NAS_IP"
+        log "Using configured service IP: $NAS_IP"
+        return 0
+    fi
 
     ip_bin="$(find_command ip)"
     if [[ -z "$ip_bin" && -x /sbin/ip ]]; then
@@ -260,8 +285,8 @@ select_free_ports() {
     local mcp_port=0
 
     for index in $(seq 1 200); do
-        couchdb_port=$((5980 + index))
-        mcp_port=$((8780 + index))
+        couchdb_port=$((COUCHDB_PORT_BASE + index))
+        mcp_port=$((MCP_PORT_BASE + index))
 
         if ! port_in_use "$couchdb_port" && ! port_in_use "$mcp_port"; then
             COUCHDB_PORT="$couchdb_port"
@@ -272,6 +297,24 @@ select_free_ports() {
     done
 
     die "Cannot find a free CouchDB/MCP port pair"
+}
+
+validate_runtime_config() {
+    [[ "$BASE_ROOT" == /* && "$BASE_ROOT" != "/" ]] \
+        || die "BASE_ROOT must be an absolute path other than /"
+    [[ "$USER_HOME_ROOT" == /* && "$USER_HOME_ROOT" != "/" ]] \
+        || die "USER_HOME_ROOT must be an absolute path other than /"
+
+    [[ "$COUCHDB_PORT_BASE" =~ ^[0-9]+$ ]] \
+        || die "COUCHDB_PORT_BASE must be numeric"
+    [[ "$MCP_PORT_BASE" =~ ^[0-9]+$ ]] \
+        || die "MCP_PORT_BASE must be numeric"
+    [[ "$COUCHDB_UID" =~ ^[0-9]+$ ]] || die "COUCHDB_UID must be numeric"
+    [[ "$COUCHDB_GID" =~ ^[0-9]+$ ]] || die "COUCHDB_GID must be numeric"
+    (( COUCHDB_PORT_BASE >= 1024 && COUCHDB_PORT_BASE <= 65335 )) \
+        || die "COUCHDB_PORT_BASE must be between 1024 and 65335"
+    (( MCP_PORT_BASE >= 1024 && MCP_PORT_BASE <= 65335 )) \
+        || die "MCP_PORT_BASE must be between 1024 and 65335"
 }
 
 validate_arguments() {
@@ -318,7 +361,7 @@ headers=accept,authorization,content-type,origin,referer,cache-control
 max_age=3600
 EOF
 
-    chown root:root "$BASE_DIR/config/livesync.ini"
+    chown "$COUCHDB_UID:$COUCHDB_GID" "$BASE_DIR/config/livesync.ini"
     chmod 644 "$BASE_DIR/config/livesync.ini"
 }
 
@@ -512,6 +555,20 @@ cleanup_on_exit() {
         if [[ -n "$BASE_DIR" && -d "$BASE_DIR" ]]; then
             (
                 cd "$BASE_DIR" 2>/dev/null || exit 0
+                warn "Container status at failure:"
+                "${COMPOSE[@]}" ps >&2 || true
+                warn "CouchDB runtime state:"
+                docker inspect --format '{{json .State}}' \
+                    "obsidian-couchdb-${STACK_ID}" >&2 || true
+                warn "CouchDB image user:"
+                docker image inspect --format '{{json .Config.User}}' \
+                    "$COUCHDB_IMAGE" >&2 || true
+                warn "Generated directory ownership:"
+                ls -ldn "$BASE_DIR" "$BASE_DIR/config" \
+                    "$BASE_DIR/config/livesync.ini" \
+                    "$BASE_DIR/couchdb-data" >&2 || true
+                warn "Recent container logs:"
+                "${COMPOSE[@]}" logs --no-color --tail 100 >&2 || true
                 "${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
             )
             rm -rf "$BASE_DIR"
@@ -527,6 +584,7 @@ cleanup_on_exit() {
 
 main() {
     require_root
+    validate_runtime_config
 
     command -v docker >/dev/null 2>&1 || die "Docker is not installed"
     docker info >/dev/null 2>&1 || die "Docker service is not running"
@@ -590,8 +648,8 @@ main() {
         "$BASE_DIR/couchdb-data" \
         "$BASE_DIR/mcp-data"
 
-    chown root:root "$BASE_DIR" "$BASE_DIR/config" \
-        "$BASE_DIR/couchdb-data" "$BASE_DIR/mcp-data"
+    chown root:root "$BASE_DIR" "$BASE_DIR/config" "$BASE_DIR/mcp-data"
+    chown "$COUCHDB_UID:$COUCHDB_GID" "$BASE_DIR/couchdb-data"
     chmod 700 "$BASE_DIR" "$BASE_DIR/config" \
         "$BASE_DIR/couchdb-data" "$BASE_DIR/mcp-data"
 
