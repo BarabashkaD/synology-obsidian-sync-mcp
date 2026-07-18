@@ -4,6 +4,10 @@ set -Eeuo pipefail
 BASE_ROOT="${BASE_ROOT:-/volume1/docker/obsidian-users}"
 USER_HOME_ROOT="${USER_HOME_ROOT:-/var/services/homes}"
 NAS_IP="${NAS_IP:-}"
+DEPLOYMENT_MODE="${DEPLOYMENT_MODE:-dsm-reverse-proxy}"
+NAS_HOSTNAME="${NAS_HOSTNAME:-}"
+OBSIDIAN_DOMAIN="${OBSIDIAN_DOMAIN:-}"
+SHOW_SECRETS_IN_REPORT="${SHOW_SECRETS_IN_REPORT:-true}"
 # Upstream package version 0.5.2. GHCR does not publish versioned tags.
 MCP_IMAGE="${MCP_IMAGE:-ghcr.io/es617/obsidian-sync-mcp@sha256:59ab4dbe7af00417331c37c1c260df320d3bbd1bb7c6a3386a5d4c1c0ece5850}"
 COUCHDB_IMAGE="${COUCHDB_IMAGE:-couchdb:3}"
@@ -16,6 +20,11 @@ LOCK_DIR="${BASE_ROOT}/.create.lock"
 INSTALL_IN_PROGRESS=0
 BASE_DIR=""
 USER_CONNECTION_FILE=""
+SERVICE_BIND_IP=""
+INTERNAL_SERVICE_IP=""
+COUCHDB_PUBLIC_URL=""
+MCP_PUBLIC_URL=""
+SERVICE_ID=""
 
 log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -185,6 +194,109 @@ detect_nas_ip() {
     log "Detected NAS LAN IP: $NAS_IP"
 }
 
+is_dns_name() {
+    local name="$1"
+    [[ ${#name} -le 253 ]] || return 1
+    [[ "$name" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+    [[ "$name" == *.* ]] || return 1
+    [[ "$name" != *..* ]]
+}
+
+resolve_ipv4() {
+    local name="$1"
+
+    if command -v getent >/dev/null 2>&1; then
+        getent ahostsv4 "$name" 2>/dev/null | awk '{print $1}' | sort -u
+    elif command -v nslookup >/dev/null 2>&1; then
+        nslookup "$name" 2>/dev/null \
+            | awk '/^Address: / {print $2}' | grep -E '^[0-9]+(\.[0-9]+){3}$' \
+            | sort -u
+    else
+        die "DNS validation requires getent or nslookup"
+    fi
+}
+
+detect_nas_hostname() {
+    local detected=""
+
+    if [[ -n "$NAS_HOSTNAME" ]]; then
+        detected="${NAS_HOSTNAME%.}"
+    else
+        detected="$(hostname -f 2>/dev/null || true)"
+        detected="${detected%.}"
+    fi
+
+    is_dns_name "$detected" \
+        || die "Cannot detect a fully qualified NAS hostname. Set NAS_HOSTNAME, for example nas.home.example.com"
+
+    NAS_HOSTNAME="${detected,,}"
+    OBSIDIAN_DOMAIN="${OBSIDIAN_DOMAIN:-$NAS_HOSTNAME}"
+    OBSIDIAN_DOMAIN="${OBSIDIAN_DOMAIN%.}"
+    is_dns_name "$OBSIDIAN_DOMAIN" \
+        || die "OBSIDIAN_DOMAIN must be a fully qualified DNS name"
+
+    COUCHDB_HOSTNAME="${SERVICE_ID}-sync.${OBSIDIAN_DOMAIN}"
+    MCP_HOSTNAME="${SERVICE_ID}-mcp.${OBSIDIAN_DOMAIN}"
+
+    log "NAS hostname: $NAS_HOSTNAME"
+    log "Obsidian service domain: $OBSIDIAN_DOMAIN"
+}
+
+validate_service_hostname_availability() {
+    local env_file=""
+    local configured_hostname=""
+
+    for env_file in "$BASE_ROOT"/*/.env; do
+        [[ -f "$env_file" ]] || continue
+        while IFS= read -r configured_hostname; do
+            if [[ "$configured_hostname" == "$COUCHDB_HOSTNAME" \
+                || "$configured_hostname" == "$MCP_HOSTNAME" ]]; then
+                die "Service hostname '$configured_hostname' is already used by stack '$(basename "$(dirname "$env_file")")'"
+            fi
+        done < <(sed -n -e 's/^COUCHDB_HOSTNAME=//p' -e 's/^MCP_HOSTNAME=//p' "$env_file")
+    done
+}
+
+validate_proxy_dns() {
+    local hostname=""
+    local addresses=""
+
+    for hostname in "$NAS_HOSTNAME" "$COUCHDB_HOSTNAME" "$MCP_HOSTNAME"; do
+        addresses="$(resolve_ipv4 "$hostname" || true)"
+        if ! grep -Fxq "$NAS_IP" <<< "$addresses"; then
+            warn "DNS lookup for '$hostname' returned: ${addresses:-no IPv4 address}"
+            die "Local DNS must resolve '$hostname' to NAS address $NAS_IP"
+        fi
+    done
+
+    log "Validated NAS and per-user service names in local DNS"
+}
+
+configure_deployment() {
+    case "$DEPLOYMENT_MODE" in
+        dsm-reverse-proxy)
+            detect_nas_hostname
+            validate_proxy_dns
+            validate_service_hostname_availability
+            SERVICE_BIND_IP="127.0.0.1"
+            INTERNAL_SERVICE_IP="127.0.0.1"
+            COUCHDB_PUBLIC_URL="https://${COUCHDB_HOSTNAME}"
+            MCP_PUBLIC_URL="https://${MCP_HOSTNAME}"
+            ;;
+        direct-http)
+            SERVICE_BIND_IP="$NAS_IP"
+            INTERNAL_SERVICE_IP="$NAS_IP"
+            COUCHDB_HOSTNAME=""
+            MCP_HOSTNAME=""
+            COUCHDB_PUBLIC_URL="http://${NAS_IP}:${COUCHDB_PORT}"
+            MCP_PUBLIC_URL="http://${NAS_IP}:${MCP_PORT}"
+            ;;
+        *)
+            die "DEPLOYMENT_MODE must be 'dsm-reverse-proxy' or 'direct-http'"
+            ;;
+    esac
+}
+
 list_stack_ids() {
     local dir=""
 
@@ -315,6 +427,11 @@ validate_runtime_config() {
         || die "COUCHDB_PORT_BASE must be between 1024 and 65335"
     (( MCP_PORT_BASE >= 1024 && MCP_PORT_BASE <= 65335 )) \
         || die "MCP_PORT_BASE must be between 1024 and 65335"
+
+    [[ "$DEPLOYMENT_MODE" == "dsm-reverse-proxy" || "$DEPLOYMENT_MODE" == "direct-http" ]] \
+        || die "DEPLOYMENT_MODE must be 'dsm-reverse-proxy' or 'direct-http'"
+    [[ "$SHOW_SECRETS_IN_REPORT" == "true" || "$SHOW_SECRETS_IN_REPORT" == "false" ]] \
+        || die "SHOW_SECRETS_IN_REPORT must be 'true' or 'false'"
 }
 
 validate_arguments() {
@@ -330,7 +447,11 @@ validate_arguments() {
         | tr '[:upper:]' '[:lower:]' \
         | sed 's/[^a-z0-9_.-]/-/g')"
 
+    SERVICE_ID="$(printf '%s' "$STACK_ID" \
+        | sed 's/[^a-z0-9-]/-/g; s/^-*//; s/-*$//')"
+
     [[ -n "$STACK_ID" ]] || die "Cannot generate stack ID"
+    [[ -n "$SERVICE_ID" ]] || die "Cannot generate DNS service ID"
 }
 
 write_couchdb_config() {
@@ -372,6 +493,7 @@ write_env_file() {
     cat > "$BASE_DIR/.env" <<EOF
 NAS_IP=${NAS_IP}
 STACK_ID=${STACK_ID}
+SERVICE_ID=${SERVICE_ID}
 DSM_USER=${DSM_USER}
 VAULT_NAME="${safe_vault_name}"
 
@@ -388,6 +510,13 @@ COUCHDB_OBFUSCATE_PROPERTIES=true
 
 MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
 MCP_PORT=${MCP_PORT}
+
+DEPLOYMENT_MODE=${DEPLOYMENT_MODE}
+SERVICE_BIND_IP=${SERVICE_BIND_IP}
+COUCHDB_HOSTNAME=${COUCHDB_HOSTNAME}
+MCP_HOSTNAME=${MCP_HOSTNAME}
+COUCHDB_PUBLIC_URL=${COUCHDB_PUBLIC_URL}
+MCP_PUBLIC_URL=${MCP_PUBLIC_URL}
 EOF
 
     chown root:root "$BASE_DIR/.env"
@@ -403,7 +532,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "${NAS_IP}:${COUCHDB_PORT}:5984"
+      - "${SERVICE_BIND_IP}:${COUCHDB_PORT}:5984"
 
     environment:
       COUCHDB_USER: "${COUCHDB_ADMIN_USER}"
@@ -419,7 +548,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "${NAS_IP}:${MCP_PORT}:8787"
+      - "${SERVICE_BIND_IP}:${MCP_PORT}:8787"
 
     environment:
       COUCHDB_URL: "http://couchdb:5984"
@@ -430,7 +559,7 @@ services:
       COUCHDB_OBFUSCATE_PROPERTIES: "${COUCHDB_OBFUSCATE_PROPERTIES}"
       VAULT_NAME: "${VAULT_NAME}"
       MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"
-      BASE_URL: "http://${NAS_IP}:${MCP_PORT}"
+      BASE_URL: "${MCP_PUBLIC_URL}"
       DATA_DIR: "/data"
       MCP_REFRESH_DAYS: "14"
 
@@ -452,7 +581,7 @@ write_user_connection_file() {
     mkdir -p "$USER_SECRET_DIR"
     cat > "$USER_CONNECTION_FILE" <<EOF
 OBSIDIAN LIVESYNC
-Server URI: http://${NAS_IP}:${COUCHDB_PORT}
+Server URI: ${COUCHDB_PUBLIC_URL}
 Username: ${STACK_ID}
 Password: ${LIVESYNC_PASSWORD}
 Database: obsidian
@@ -460,7 +589,7 @@ E2EE passphrase: ${COUCHDB_PASSPHRASE}
 Obfuscate Properties: true
 
 OBSIDIAN MCP
-Endpoint: http://${NAS_IP}:${MCP_PORT}/mcp
+Endpoint: ${MCP_PUBLIC_URL}/mcp
 Auth token: ${MCP_AUTH_TOKEN}
 Vault name: ${VAULT_NAME}
 EOF
@@ -475,7 +604,7 @@ wait_for_couchdb() {
     for _ in $(seq 1 60); do
         if http_request -fsS \
             -u "${COUCHDB_ADMIN_USER}:${COUCHDB_ADMIN_PASSWORD}" \
-            "http://${NAS_IP}:${COUCHDB_PORT}/_up" >/dev/null 2>&1; then
+            "http://${INTERNAL_SERVICE_IP}:${COUCHDB_PORT}/_up" >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -490,13 +619,13 @@ initialize_couchdb() {
     for database in _users _replicator _global_changes "$COUCHDB_DATABASE"; do
         http_request -sS \
             -u "${COUCHDB_ADMIN_USER}:${COUCHDB_ADMIN_PASSWORD}" \
-            -X PUT "http://${NAS_IP}:${COUCHDB_PORT}/${database}" >/dev/null
+            -X PUT "http://${INTERNAL_SERVICE_IP}:${COUCHDB_PORT}/${database}" >/dev/null
     done
 
     http_request -fsS \
         -u "${COUCHDB_ADMIN_USER}:${COUCHDB_ADMIN_PASSWORD}" \
         -X PUT \
-        "http://${NAS_IP}:${COUCHDB_PORT}/_users/org.couchdb.user:${LIVESYNC_USER}" \
+        "http://${INTERNAL_SERVICE_IP}:${COUCHDB_PORT}/_users/org.couchdb.user:${LIVESYNC_USER}" \
         -H "Content-Type: application/json" \
         --data-binary "{
             \"name\":\"${LIVESYNC_USER}\",
@@ -508,7 +637,7 @@ initialize_couchdb() {
     http_request -fsS \
         -u "${COUCHDB_ADMIN_USER}:${COUCHDB_ADMIN_PASSWORD}" \
         -X PUT \
-        "http://${NAS_IP}:${COUCHDB_PORT}/${COUCHDB_DATABASE}/_security" \
+        "http://${INTERNAL_SERVICE_IP}:${COUCHDB_PORT}/${COUCHDB_DATABASE}/_security" \
         -H "Content-Type: application/json" \
         --data-binary "{
             \"admins\":{
@@ -523,7 +652,7 @@ initialize_couchdb() {
 
     http_request -fsS \
         -u "${LIVESYNC_USER}:${LIVESYNC_PASSWORD}" \
-        "http://${NAS_IP}:${COUCHDB_PORT}/${COUCHDB_DATABASE}" >/dev/null
+        "http://${INTERNAL_SERVICE_IP}:${COUCHDB_PORT}/${COUCHDB_DATABASE}" >/dev/null
 }
 
 wait_for_mcp() {
@@ -532,7 +661,7 @@ wait_for_mcp() {
     log "Waiting for MCP HTTP endpoint"
     for _ in $(seq 1 60); do
         status="$(http_request -sS -o /dev/null -w '%{http_code}' \
-            "http://${NAS_IP}:${MCP_PORT}/mcp" 2>/dev/null || true)"
+            "http://${INTERNAL_SERVICE_IP}:${MCP_PORT}/mcp" 2>/dev/null || true)"
 
         if [[ "$status" =~ ^[1-5][0-9][0-9]$ ]]; then
             return 0
@@ -541,6 +670,148 @@ wait_for_mcp() {
     done
 
     return 1
+}
+
+print_installation_report() {
+    local report_livesync_password="$LIVESYNC_PASSWORD"
+    local report_passphrase="$COUCHDB_PASSPHRASE"
+    local report_mcp_token="$MCP_AUTH_TOKEN"
+
+    if [[ "$SHOW_SECRETS_IN_REPORT" == "false" ]]; then
+        report_livesync_password="<stored in user connection file>"
+        report_passphrase="<stored in user connection file>"
+        report_mcp_token="<stored in user connection file>"
+    fi
+
+    if [[ "$DEPLOYMENT_MODE" == "dsm-reverse-proxy" ]]; then
+        cat <<EOF
+
+===============================================================================
+OBSIDIAN STACK INSTALLATION REPORT
+===============================================================================
+
+Installation status
+  Backend installation: SUCCESS
+  CouchDB readiness:     VALIDATED with administrator authentication
+  LiveSync database:     VALIDATED with the generated user
+  MCP HTTP endpoint:     REACHABLE
+  DSM HTTPS proxy:       REQUIRES CONFIGURATION
+
+Stack
+  Synology user:         ${DSM_USER}
+  Stack ID:              ${STACK_ID}
+  DNS service ID:        ${SERVICE_ID}
+  Vault name:            ${VAULT_NAME}
+  Configuration:         ${BASE_DIR}
+  User connection file:  ${USER_CONNECTION_FILE}
+
+Internal services
+  CouchDB target:        http://127.0.0.1:${COUCHDB_PORT}
+  MCP target:            http://127.0.0.1:${MCP_PORT}/mcp
+  Network exposure:      NAS loopback only
+
+Public HTTPS services
+  CouchDB hostname:      ${COUCHDB_HOSTNAME}
+  CouchDB URL:           ${COUCHDB_PUBLIC_URL}
+  MCP hostname:          ${MCP_HOSTNAME}
+  MCP URL:               ${MCP_PUBLIC_URL}/mcp
+
+LiveSync credentials
+  Username:              ${LIVESYNC_USER}
+  Password:              ${report_livesync_password}
+  Database:              ${COUCHDB_DATABASE}
+  E2EE passphrase:       ${report_passphrase}
+  Obfuscate properties:  ${COUCHDB_OBFUSCATE_PROPERTIES}
+
+MCP credentials
+  Authentication token:  ${report_mcp_token}
+  Vault name:             ${VAULT_NAME}
+
+Required DSM steps
+  1. Open Control Panel > Login Portal > Advanced > Reverse Proxy.
+  2. Create the CouchDB rule:
+       Name:                 Obsidian ${DSM_USER} Sync
+       Source protocol:      HTTPS
+       Source hostname:      ${COUCHDB_HOSTNAME}
+       Source port:          443
+       Destination protocol: HTTP
+       Destination hostname: 127.0.0.1
+       Destination port:     ${COUCHDB_PORT}
+  3. Create the MCP rule:
+       Name:                 Obsidian ${DSM_USER} MCP
+       Source protocol:      HTTPS
+       Source hostname:      ${MCP_HOSTNAME}
+       Source port:          443
+       Destination protocol: HTTP
+       Destination hostname: 127.0.0.1
+       Destination port:     ${MCP_PORT}
+       Proxy read timeout:   600 seconds or longer
+  4. Open Control Panel > Security > Certificate > Settings.
+  5. Assign a trusted certificate covering both service hostnames. A wildcard
+     certificate for *.${OBSIDIAN_DOMAIN} can cover all user stacks.
+  6. Confirm the NAS firewall allows HTTPS port 443 from the intended LAN or
+     VPN networks. Do not expose the internal CouchDB or MCP ports.
+
+Obsidian Self-hosted LiveSync settings
+  Remote type:           CouchDB
+  Server URI:            ${COUCHDB_PUBLIC_URL}
+  Username:              ${LIVESYNC_USER}
+  Password:              ${report_livesync_password}
+  Database:              ${COUCHDB_DATABASE}
+  End-to-end encryption: Enabled
+  Passphrase:            ${report_passphrase}
+  Obfuscate properties:  Enabled
+
+MCP client settings
+  Endpoint:              ${MCP_PUBLIC_URL}/mcp
+  Authorization token:   ${report_mcp_token}
+  Vault:                 ${VAULT_NAME}
+
+Final validation
+  1. From a client, confirm ${COUCHDB_HOSTNAME} and ${MCP_HOSTNAME} resolve to
+     ${NAS_IP}.
+  2. Open ${COUCHDB_PUBLIC_URL}/_up. An unauthenticated 401 response confirms
+     DNS, TLS and proxy routing; an authenticated request must return HTTP 200.
+  3. Use "Test Database Connection" in Self-hosted LiveSync.
+  4. Initialize an MCP session through ${MCP_PUBLIC_URL}/mcp using the token.
+  5. Create a test note, confirm synchronization, then read it through MCP.
+
+SECURITY NOTICE
+  This report contains passwords, an encryption passphrase and an MCP token.
+  The same values are stored in ${USER_CONNECTION_FILE} with user-only access.
+===============================================================================
+EOF
+    else
+        cat <<EOF
+
+===============================================================================
+OBSIDIAN STACK INSTALLATION REPORT - DIRECT HTTP TEST MODE
+===============================================================================
+
+Installation status:     SUCCESS
+Synology/Linux user:     ${DSM_USER}
+Vault name:              ${VAULT_NAME}
+Configuration:           ${BASE_DIR}
+User connection file:    ${USER_CONNECTION_FILE}
+
+LiveSync
+  Server URI:            ${COUCHDB_PUBLIC_URL}
+  Username:              ${LIVESYNC_USER}
+  Password:              ${report_livesync_password}
+  Database:              ${COUCHDB_DATABASE}
+  E2EE passphrase:       ${report_passphrase}
+  Obfuscate properties:  ${COUCHDB_OBFUSCATE_PROPERTIES}
+
+MCP
+  Endpoint:              ${MCP_PUBLIC_URL}/mcp
+  Authentication token: ${report_mcp_token}
+  Vault:                 ${VAULT_NAME}
+
+This mode exposes unencrypted HTTP endpoints and is intended only for isolated
+testing. Use dsm-reverse-proxy mode for a DSM installation.
+===============================================================================
+EOF
+    fi
 }
 
 cleanup_on_exit() {
@@ -631,6 +902,7 @@ main() {
     fi
 
     select_free_ports
+    configure_deployment
 
     COUCHDB_ADMIN_USER="admin"
     COUCHDB_ADMIN_PASSWORD="$(openssl rand -hex 24)"
@@ -675,14 +947,8 @@ main() {
 
     INSTALL_IN_PROGRESS=0
 
-    log "Stack created successfully"
-    log "User: $DSM_USER"
-    log "CouchDB: http://${NAS_IP}:${COUCHDB_PORT}"
-    log "MCP: http://${NAS_IP}:${MCP_PORT}/mcp"
-    log "Root configuration: $BASE_DIR"
-    log "User connection file: $USER_CONNECTION_FILE"
-
     "${COMPOSE[@]}" ps
+    print_installation_report
 }
 
 main "$@"

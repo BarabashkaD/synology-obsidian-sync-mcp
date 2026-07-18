@@ -89,6 +89,8 @@ main() {
     BASE_ROOT="$STACK_ROOT" \
     USER_HOME_ROOT="$HOME_ROOT" \
     NAS_IP="127.0.0.1" \
+    DEPLOYMENT_MODE="direct-http" \
+    SHOW_SECRETS_IN_REPORT="false" \
     COUCHDB_PORT_BASE="15980" \
     MCP_PORT_BASE="18780" \
         "$REPO_ROOT/create-obsidian-user-stack.sh" "$TEST_USER" "CI Vault"
@@ -106,6 +108,11 @@ main() {
 
     [[ "$(stat -c '%a' "$STACK_DIR/.env")" == "600" ]] \
         || fail ".env permissions are not 600"
+    [[ "$DEPLOYMENT_MODE" == "direct-http" && "$SERVICE_BIND_IP" == "127.0.0.1" ]] \
+        || fail "Integration stack did not use direct HTTP loopback mode"
+    grep -Fq 'Server URI: http://127.0.0.1:' \
+        "$HOME_ROOT/$TEST_USER/.config/obsidian-sync-mcp/connection.txt" \
+        || fail "Direct HTTP connection URL is incorrect"
     [[ "$(stat -c '%U' "$HOME_ROOT/$TEST_USER/.config/obsidian-sync-mcp/connection.txt")" == "$TEST_USER" ]] \
         || fail "Connection file owner is incorrect"
 
@@ -145,11 +152,13 @@ main() {
 
     log "Testing status and duplicate protection"
     status_output="$(BASE_ROOT="$STACK_ROOT" USER_HOME_ROOT="$HOME_ROOT" \
-        NAS_IP="127.0.0.1" "$REPO_ROOT/create-obsidian-user-stack.sh" --status)"
+        NAS_IP="127.0.0.1" DEPLOYMENT_MODE="direct-http" \
+        "$REPO_ROOT/create-obsidian-user-stack.sh" --status)"
     grep -Eq "^[[:space:]]*${TEST_USER}[[:space:]]+CouchDB=$COUCHDB_PORT MCP=$MCP_PORT$" \
         <<< "$status_output" || fail "Status did not report the installed stack and ports"
 
     if BASE_ROOT="$STACK_ROOT" USER_HOME_ROOT="$HOME_ROOT" NAS_IP="127.0.0.1" \
+        DEPLOYMENT_MODE="direct-http" \
         "$REPO_ROOT/create-obsidian-user-stack.sh" "$TEST_USER" "CI Vault"; then
         fail "Duplicate installation unexpectedly succeeded"
     fi

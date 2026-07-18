@@ -15,6 +15,7 @@ jobs:
       - name: Bash syntax
         run: |
           bash -n create-obsidian-user-stack.sh
+          bash -n tests/setup-local-reproxy.sh
           bash -n tests/run-linux-integration.sh
           node --check tests/test-mcp.mjs
       - name: ShellCheck
