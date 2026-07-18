@@ -71,8 +71,9 @@ validate_settings() {
 
     local port
     for port in "$HTTPS_PORT" "$COUCHDB_PORT" "$MCP_PORT"; do
-        [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) \
-            || die "Invalid port: $port"
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+            die "Invalid port: $port"
+        fi
     done
 
     [[ "$COUCHDB_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || die "Invalid COUCHDB_HOST"
