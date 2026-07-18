@@ -100,7 +100,7 @@ main() {
 
     # The generated values contain only validated names, addresses, ports and hex secrets.
     set -a
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090,SC1091
     source "$STACK_DIR/.env"
     set +a
 
@@ -146,7 +146,7 @@ main() {
     log "Testing status and duplicate protection"
     status_output="$(BASE_ROOT="$STACK_ROOT" USER_HOME_ROOT="$HOME_ROOT" \
         NAS_IP="127.0.0.1" "$REPO_ROOT/create-obsidian-user-stack.sh" --status)"
-    grep -Eq "^[[:space:]]*$TEST_USER[[:space:]]+CouchDB=$COUCHDB_PORT MCP=$MCP_PORT$" \
+    grep -Eq "^[[:space:]]*${TEST_USER}[[:space:]]+CouchDB=$COUCHDB_PORT MCP=$MCP_PORT$" \
         <<< "$status_output" || fail "Status did not report the installed stack and ports"
 
     if BASE_ROOT="$STACK_ROOT" USER_HOME_ROOT="$HOME_ROOT" NAS_IP="127.0.0.1" \
